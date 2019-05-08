@@ -1,154 +1,138 @@
-var net = require('net');
-var events = require('events');
-var util = require('util');
-var networkAddress = require('network-address');
-var lpmessage = require('length-prefixed-message');
+import {connect as _connect, createServer} from 'net'
+import {EventEmitter} from 'events'
+import {read, write} from 'length-prefixed-message'
+import networkAddress from 'network-address'
 
-var attachCleanup = function(self, peer, socket) {
-  socket.on('close', function() {
-    if (peer.socket === socket) peer.socket = null;
-    if (peer.pendingSocket === socket) peer.pendingSocket = null;
-    if (peer.socket) return;
 
-    if (!peer.host) return delete self.peers[peer.id];
+export default class Topology extends EventEmitter {
+  me     = ''
+  peers  = {}
+  server = null
 
-    var reconnect = function() {
-      connect(self, peer);
-    };
+  constructor (me, peers) {
+    super()
 
-    peer.retries++;
-    peer.reconnectTimeout = setTimeout(reconnect, (1 << peer.retries) * 250);
-    self.emit('reconnect', peer.id, peer.retries);
-  });
-};
+    this.me = me
+    if (!(this instanceof Topology)) return new Topology(me, peers)
+    if (/^\d+$/.test(me)) me = networkAddress() + ':' + me
+    if (this.me) this.listen(Number(me.split(':')[1]))
 
-var errorHandle = function(self, socket) {
-  socket.on('error', function() {
-    socket.destroy();
-  });
+    EventEmitter.call(this)
 
-  socket.setTimeout(15000, function() { // 15s to do the handshake
-    socket.destroy();
-  });
-};
+    if (peers) for (let peer of Object.values(peers)) this.add(peer)
+  }
 
-var onready = function(self, peer, socket) {
-  socket.setTimeout(0); // reset timeout
-  var oldSocket = peer.socket;
-  peer.retries = 0;
-  peer.socket = socket;
-  peer.pendingSocket = null;
-  if (oldSocket) oldSocket.destroy();
-  self.emit('connection', peer.socket, peer.id);
-};
+  peer (addr) {
+    return (this.peers[addr] && this.peers[addr].socket) || null
+  }
 
-var onconnection = function(self, socket) {
-  errorHandle(self, socket);
-  lpmessage.read(socket, function(from) {
-    from = from.toString();
+  listen (port) {
+    this.server = createServer(socket => {this.onconnection(socket)})
+    this.server.listen(port)
+  }
 
-    var peer = self.peers[from] = self.peers[from] || {id:from};
-    if (from > self.me) return connect(self, peer, socket);
+  add (addr) {
+    if (addr === this.me) return
 
-    lpmessage.write(socket, self.me);
-    attachCleanup(self, peer, socket);
-    onready(self, peer, socket);
-  });
-};
+    var host = addr.split(':')[0]
+    var port = Number(addr.split(':')[1])
+    var peer = this.peers[addr] = this.peers[addr] || {id:addr}
 
-var connect = function(self, peer, socket) {
-  if (peer.socket || peer.pendingSocket) return socket && socket.destroy();
-  if (peer.reconnectTimeout) clearTimeout(peer.reconnectTimeout);
+    peer.host = host
+    peer.port = port
+    peer.retries = 0
+    peer.reconnectTimeout = peer.reconnectTimeout || null
+    peer.pendingSocket = peer.pendingSocket || null
+    peer.socket = peer.socket || null
 
-  if (!socket) socket = net.connect(peer.port, peer.host);
-  lpmessage.write(socket, self.me);
-  peer.pendingSocket = socket;
+    this.connect(peer)
+  }
 
-  if (self.me > peer.id) return onconnection(self, socket);
+  remove (addr) {
+    if (addr === this.me) return
 
-  errorHandle(self, socket);
-  attachCleanup(self, peer, socket);
+    var peer = this.peers[addr]
 
-  lpmessage.read(socket, function() {
-    onready(self, peer, socket);
-  });
-};
+    if (!peer) return
 
-var Topology = function(me, peers) {
-  if (!(this instanceof Topology)) return new Topology(me, peers);
-  if (/^\d+$/.test(me)) me = networkAddress()+':'+me;
+    delete this.peers[addr]
+    peer.host = null // will stop reconnects
 
-  this.me = me || '';
-  this.peers = {};
-  this.server = null;
+    if (peer.socket) peer.socket.destroy()
+    if (peer.pendingSocket) peer.pendingSocket.destroy()
 
-  if (this.me) this.listen(Number(me.split(':')[1]));
+    clearTimeout(peer.reconnectTimeout)
+  }
 
-  events.EventEmitter.call(this);
+  destroy () {
+    if (this.server) this.server.close()
+    Object.keys(this.peers).forEach(this.remove.bind(this))
+  }
 
-  if (peers) [].concat(peers).forEach(this.add.bind(this));
-};
+  get connections () {
+    var peers = this.peers
 
-util.inherits(Topology, events.EventEmitter);
+    return Object.keys(peers).map(id => {return peers[id].socket}).filter(socket => socket)
+  }
 
-Topology.prototype.__defineGetter__('connections', function() {
-  var peers = this.peers;
-  return Object.keys(peers)
-    .map(function(id) {
-      return peers[id].socket;
+  onconnection (socket) {
+    this.errorHandle(socket)
+    read(socket, from => {
+      from = from.toString()
+
+      var peer = this.peers[from] = this.peers[from] || {id:from}
+      if (from > this.me) return this.connect(peer, socket)
+
+      write(socket, this.me)
+      this.attachCleanup(peer, socket)
+      this.onready(peer, socket)
     })
-    .filter(function(socket) {
-      return socket;
-    });
-});
+  };
 
-Topology.prototype.peer = function(addr) {
-  return (this.peers[addr] && this.peers[addr].socket) || null;
-};
+  attachCleanup (peer, socket) {
+    socket.on('close', function () {
+      if (peer.socket === socket) peer.socket = null
+      if (peer.pendingSocket === socket) peer.pendingSocket = null
+      if (peer.socket) return
 
-Topology.prototype.listen = function(port) {
-  var self = this;
+      if (!peer.host) return delete this.peers[peer.id]
 
-  this.server = net.createServer(function(socket) {
-    onconnection(self, socket);
-  });
+      peer.retries++
+      peer.reconnectTimeout = setTimeout(() => {connect(peer)}, (1 << peer.retries) * 250)
+      this.emit('reconnect', peer.id, peer.retries)
+    })
+  };
 
-  this.server.listen(port);
-};
+  errorHandle (socket) {
+    socket.on('error', () => {socket.destroy()})
 
-Topology.prototype.add = function(addr) {
-  if (addr === this.me) return;
+    // 15s to do the handshake
+    socket.setTimeout(15000, () => {socket.destroy()})
+  };
 
-  var host = addr.split(':')[0];
-  var port = Number(addr.split(':')[1]);
-  var peer = this.peers[addr] = this.peers[addr] || {id:addr};
+  onready (peer, socket) {
+    socket.setTimeout(0) // reset timeout
+    var oldSocket = peer.socket
+    peer.retries = 0
+    peer.socket = socket
+    peer.pendingSocket = null
+    if (oldSocket) oldSocket.destroy()
+    this.emit('connection', peer.socket, peer.id)
+  };
 
-  peer.host = host;
-  peer.port = port;
-  peer.retries = 0;
-  peer.reconnectTimeout = peer.reconnectTimeout || null;
-  peer.pendingSocket = peer.pendingSocket || null;
-  peer.socket = peer.socket || null;
+  connect (peer, socket) {
+    if (peer.socket || peer.pendingSocket) return socket && socket.destroy()
+    if (peer.reconnectTimeout) clearTimeout(peer.reconnectTimeout)
 
-  connect(this, peer);
-};
+    if (!socket) socket = _connect(peer.port, peer.host)
+    write(socket, this.me)
+    peer.pendingSocket = socket
 
-Topology.prototype.remove = function(addr) {
-  if (addr === this.me) return;
+    if (this.me > peer.id) return this.onconnection(socket)
 
-  var peer = this.peers[addr];
-  if (!peer) return;
+    this.errorHandle(socket)
+    this.attachCleanup(peer, socket)
 
-  delete this.peers[addr];
-  peer.host = null; // will stop reconnects
-  if (peer.socket) peer.socket.destroy();
-  if (peer.pendingSocket) peer.pendingSocket.destroy();
-  clearTimeout(peer.reconnectTimeout);
-};
-
-Topology.prototype.destroy = function() {
-  if (this.server) this.server.close();
-  Object.keys(this.peers).forEach(this.remove.bind(this));
-};
-
-module.exports = Topology;
+    read(socket, () => {this.onready(peer, socket)})
+  };
+}
